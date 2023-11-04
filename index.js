@@ -49,7 +49,7 @@ async function startSock () {
           for (const key of pesan) {
             if (teksPesan.includes(key.pesan)) {
                 await sock.sendMessage(message.key.remoteJid, { text: key.balasan });
-                break; // Keluar dari loop jika pesan cocok
+                break; // Keluar dari loop jika pesan sesuai
               
             }
           }
