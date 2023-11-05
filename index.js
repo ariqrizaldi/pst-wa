@@ -45,6 +45,15 @@ async function startSock () {
                 await sock.sendMessage('120363026696537412@g.us', { text:  teks});
             }
             
+        } else if(m.type === 'notify' && teksPesan.startsWith('Update')){
+            console.log("got messages", JSON.stringify(message));
+            const hasil = await splitTeks(teksPesan);
+            const id= teksPesan.split('\n')[0].split('#')[1].trim();
+            console.log(id);
+            if (Object.keys(hasil).length > 0){
+              const status = hasil.hasOwnProperty('Status')? hasil['Status']:'';
+              await updateDataInSheet(id, status);
+          }
         } else if(m.type === 'notify'){
           for (const key of pesan) {
             if (teksPesan.includes(key.pesan)) {
