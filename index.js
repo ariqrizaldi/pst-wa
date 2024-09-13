@@ -1,111 +1,131 @@
-const { DisconnectReason, useMultiFileAuthState} = require('@whiskeysockets/baileys');
+const { DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const { Boom } = require('@hapi/boom');
-const { writeToSpreadsheet, updateDataInSheet, getPetugas, getTemplate }= require('./sheets.js');
+const { writeToSpreadsheet, updateDataInSheet, getPetugas, getTemplate } = require('./sheets.js');
 const fs = require('fs');
 
 // Membaca data dari file JSON
 const pesan = JSON.parse(fs.readFileSync('data.json', 'utf8'));
 const petugas = JSON.parse(fs.readFileSync('petugas.json', 'utf8'));
-async function startSock () {
-    const { state, saveCreds } = await useMultiFileAuthState('sessions');
+
+async function startSock() {
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     const sock = makeWASocket({
         printQRInTerminal: true,
         auth: state
     });
+
     sock.ev.on('connection.update', update => {
-        const {connection, lastDisconnect} = update;
-
-        if (connection === 'close'){
-            const connectAgain = new Boom(lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('connection closed due to ', lastDisconnect.error, ', reconnecting ', connectAgain)
-            if (connectAgain) {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'close') {
+            const shouldReconnect = new Boom(lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Koneksi terputus karena ', lastDisconnect.error, ', mencoba untuk menyambung kembali ', shouldReconnect);
+            if (shouldReconnect) {
                 startSock();
-            } else if(connection === 'open') {
-                console.log('opened connection')
             }
+        } else if (connection === 'open') {
+            console.log('Koneksi terbuka');
         }
-
     });
-    sock.ev.on ('creds.update', saveCreds);
+
+    sock.ev.on('creds.update', saveCreds);
+
     sock.ev.on("messages.upsert", async m => {
         const message = m.messages[0];
-        const kataKunci = "Media Pelayanan BPS";
-        const teksPesan = message.message.conversation === null ? '':message.message.conversation;;
-        if (m.type === 'notify' && teksPesan.includes(kataKunci)){
-            console.log("got messages", JSON.stringify(message));
+        const kataKunci = "Mohon tuliskan";
+
+        const teksPesan = await cekPesan(message);
+        if (m.type === 'notify' && teksPesan.includes(kataKunci)) {
             const hasil = await splitTeks(teksPesan);
-            if (Object.keys(hasil).length > 0){
-                const nama = hasil.hasOwnProperty('Nama')? hasil['Nama']:'';
-                const instansi = hasil.hasOwnProperty('Instansi')? hasil['Instansi']:'';
-                const keperluan = hasil.hasOwnProperty('Keperluan')? hasil['Keperluan']:'';
-                const values = [[uniqueId(), message.key.id, message.key.remoteJid.split('@')[0], nama, instansi, keperluan, tanggal(), 'Dalam Proses']];
-                const teks = `Ada Permintaan Layanan\n#Id ${values[0][0]}\nTanggal masuk : ${values[0][6]}\n\nNama : ${values[0][3]}\nInstansi : ${values[0][4]}\nKeperluan : ${values[0][5]}\nStatus : ${values[0][7]}`;
-                await writeToSpreadsheet(values);
-                await sock.sendMessage('120363026696537412@g.us', { text:  teks});
+            if (Object.keys(hasil).length > 0) {
+                const values = createValues(message, hasil);
+                const jid = message.key.remoteJid;
+                await Promise.all([
+                    writeToSpreadsheet(values),
+                    console.log(`${getPetugasHariIni(petugas).no_wa}@s.whatsapp.net`),
+                    console.log(jid),
+                    sock.sendMessage(jid, { text: 'Mohon menunggu, permintaan Anda akan dibalas segera oleh Petugas kami dalam waktu kurang dari 1x24 Jam ' }),
+                    sock.sendMessage('120363332565581691@g.us', { text: formatTeks(values) }),
+                    sock.sendMessage(`${getPetugasHariIni(petugas).no_wa}@s.whatsapp.net`, { text: formatTeks(values) })
+                ]);
             }
-            
-        } else if(m.type === 'notify' && teksPesan.startsWith('Update')){
-            console.log("got messages", JSON.stringify(message));
+        } else if (m.type === 'notify' && teksPesan.startsWith('Update')) {
             const hasil = await splitTeks(teksPesan);
-            const id= teksPesan.split('\n')[0].split('#')[1].trim();
-            console.log(id);
-            if (Object.keys(hasil).length > 0){
-              const status = hasil.hasOwnProperty('Status')? hasil['Status']:'';
-              await updateDataInSheet(id, status);
-          }
-        } else if(m.type === 'notify'){
-          for (const key of pesan) {
-            if (teksPesan.includes(key.pesan)) {
-                await sock.sendMessage(message.key.remoteJid, { text: key.balasan });
-                break; // Keluar dari loop jika pesan sesuai
-              
+            const id = teksPesan.split('\n')[0].split('#')[1].trim();
+            if (Object.keys(hasil).length > 0) {
+                const status = hasil['Status'] || '';
+                await updateDataInSheet(id, status);
             }
-          }
+        } else if (m.type === 'notify') {
+            for (const key of pesan) {
+                if (teksPesan.includes(key.pesan)) {
+                    await sock.sendMessage(message.key.remoteJid, { text: key.balasan });
+                    break;
+                }
+            }
         }
-      });
-};
+    });
+}
+
+function createValues(message, hasil) {
+    const nama = hasil['Nama'] || '';
+    const instansi = hasil['Instansi'] || '';
+    const keperluan = hasil['Keperluan'] || '';
+    const noWhatsapp = hasil['No WhatsApp'] || message.key.remoteJid.split('@')[0];
+    const tgl = hasil['Tanggal'] || getFormattedDate();
+    const status = hasil['Status'] || 'Dalam Proses';
+    const media = hasil['Media'] || 'WhatsApp';
+    return [[uniqueId(), message.key.id, noWhatsapp, nama, instansi, keperluan, tgl, status, media]];
+}
+
+function formatTeks(values) {
+    return `Ada Permintaan Layanan\n#Id ${values[0][0]}\nTanggal masuk: ${values[0][6]}\n\nNama: ${values[0][3]}\nInstansi: ${values[0][4]}\nKeperluan: ${values[0][5]}\nStatus: ${values[0][7]}`;
+}
+function getPetugasHariIni(petugas) {
+
+    // Mendapatkan tanggal hari ini
+    const today = new Date();
+    const tanggalHariIni = today.getDate().toString(); // Mengambil tanggal dalam bentuk string
+
+    // Mencari petugas berdasarkan tanggal
+    const petugasHariIni = petugas.find(petugas => petugas.tanggal_tugas === tanggalHariIni);
+    
+    // Mengembalikan hasil dalam bentuk object
+    if (petugasHariIni) {
+        return {
+            nama_petugas: petugasHariIni.nama_petugas,
+            no_wa: petugasHariIni.no_wa
+        };
+    } else {
+        return null; // Jika tidak ada petugas untuk tanggal tersebut
+    }
+}
 function splitTeks(teks) {
     const hasil = {};
-    const baris = teks.split('\n');
-      // Iterasi melalui setiap baris dan memisahkan "kunci" dan "nilai"
-      for (const line of baris) {
+    teks.split('\n').forEach(line => {
         if (line.includes(':')) {
-          const [kunci, nilai] = line.split(':'); // Perhatikan spasi setelah ":"
-          if (kunci && nilai) {
-            hasil[kunci.trim()] = nilai.trim();
-          }
+            const [kunci, nilai] = line.split(':');
+            if (kunci && nilai) {
+                hasil[kunci.trim()] = nilai.trim();
+            }
         }
-      }
+    });
     return hasil;
-  };
-function tanggal(){
+}
+
+function cekPesan(message) {
+    return message.message?.extendedTextMessage?.text || message.message?.conversation || '';
+}
+
+function getFormattedDate() {
     const hari = new Date();
-    const options = { year: 'numeric', month: '2-digit', day: '2-digit' };
-    const tanggal= hari.toLocaleDateString('id-ID', options);
-    return tanggal;
+    return hari.toLocaleDateString('id-ID', { year: 'numeric', month: '2-digit', day: '2-digit' });
 }
-function hari(){
-  const days = [
-    "Minggu",
-    "Senin",
-    "Selasa",
-    "Rabu",
-    "Kamis",
-    "Jumat",
-    "Sabtu"
-  ];
-  
-  const date = new Date();
-  const day = days[date.getDay()];
-  return day;
+
+function uniqueId() {
+    return `A${new Date().getTime()}${Math.floor(Math.random() * 20)}`;
 }
-function uniqueId(){
-    const timestamp = new Date().getTime();
-    const random = Math.floor(Math.random() * 20); // Nomor acak antara 0 dan 999
-    const uniqueId = `A${timestamp}${random}`;
-    return uniqueId;
-}
+
 getTemplate();
 getPetugas();
 startSock();
